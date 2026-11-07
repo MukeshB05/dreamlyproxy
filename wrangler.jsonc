@@ -1,0 +1,12 @@
+{
+  "name": "dreamlyproxy",
+  "main": "worker.js",
+  "compatibility_date": "2024-09-23",
+  "workers_dev": true,
+
+  // Optional: restrict who can use your proxy (comma-separated)
+  "vars": {
+    "ALLOWED_ORIGINS": "",
+    "BLOCKED_URLS": ""
+  }
+}
