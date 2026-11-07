@@ -111,6 +111,34 @@ function cfInfo(request) {
   };
 }
 
+// ---- HLS / streaming helpers ----
+const PLAYLIST_RE = /\.m3u8?$/i;
+const SEGMENT_RE = /\.(ts|m4s|aac|mp4|m4a|m4v|vtt|webvtt|key)$/i;
+
+// Rewrites every URL inside an .m3u8 so segments, keys and sub-playlists
+// also go through the proxy (fixes CORS / mixed-content / relative paths).
+function rewritePlaylist(text, baseUrl, proxyOrigin) {
+  const toProxy = (u) => {
+    try {
+      const abs = new URL(u, baseUrl).href;
+      return `${proxyOrigin}/?url=${encodeURIComponent(abs)}`;
+    } catch {
+      return u;
+    }
+  };
+  return text
+    .split(/\r?\n/)
+    .map((line) => {
+      const t = line.trim();
+      if (!t) return line;
+      if (t.startsWith("#")) {
+        return line.replace(/URI="([^"]+)"/g, (_, u) => `URI="${toProxy(u)}"`);
+      }
+      return toProxy(t);
+    })
+    .join("\n");
+}
+
 export default {
   async fetch(request, env) {
     const origin = request.headers.get("Origin");
@@ -210,11 +238,23 @@ export default {
     // ---- Forward the request ----
     let upstream;
     try {
+      // Edge caching: playlists 2s (keeps live streams fresh), segments 60s.
+      // Big speed-up when several viewers watch the same stream.
+      const cacheable =
+        method === "GET" && !customHeaders && !request.headers.get("authorization");
+      let cf;
+      if (cacheable && PLAYLIST_RE.test(target.pathname)) {
+        cf = { cacheEverything: true, cacheTtl: 2 };
+      } else if (cacheable && SEGMENT_RE.test(target.pathname)) {
+        cf = { cacheEverything: true, cacheTtl: 60 };
+      }
+
       upstream = await fetch(target.href, {
         method,
         headers: upstreamHeaders,
         body,
         redirect: "follow",
+        ...(cf ? { cf } : {}),
       });
     } catch (err) {
       return json({ error: "Upstream request failed", message: String(err) }, 502, origin);
@@ -232,6 +272,32 @@ export default {
     }
     responseHeaders.set("x-cors-cf-info", JSON.stringify(cfInfo(request)));
     responseHeaders.set("x-cors-final-url", upstream.url || target.href);
+
+    // ---- HLS playlist: rewrite inner URLs so they also use the proxy ----
+    const ct = (upstream.headers.get("content-type") || "").toLowerCase();
+    const isPlaylist =
+      upstream.ok &&
+      method !== "HEAD" &&
+      (ct.includes("mpegurl") || PLAYLIST_RE.test(target.pathname));
+    if (isPlaylist) {
+      const text = await upstream.text();
+      const rewritten = text.trimStart().startsWith("#EXTM3U")
+        ? rewritePlaylist(text, upstream.url || target.href, incoming.origin)
+        : text;
+      responseHeaders.delete("content-length");
+      responseHeaders.delete("content-encoding");
+      responseHeaders.set("content-type", "application/vnd.apple.mpegurl");
+      responseHeaders.set("cache-control", "public, max-age=2");
+      return new Response(rewritten, {
+        status: upstream.status,
+        headers: responseHeaders,
+      });
+    }
+
+    // Media segments: let browsers/edge reuse them
+    if (upstream.ok && SEGMENT_RE.test(target.pathname) && !responseHeaders.has("cache-control")) {
+      responseHeaders.set("cache-control", "public, max-age=60");
+    }
 
     return new Response(upstream.body, {
       status: upstream.status,
